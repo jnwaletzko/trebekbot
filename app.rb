@@ -7,6 +7,36 @@ require "dotenv"
 require "text"
 require "sanitize"
 
+def start_listener()
+  uri = URI.parse(ENV["REDISCLOUD_URL"])
+  redis = Redis.new(host: uri.host, port: uri.port, password: uri.password)
+  Thread.new do
+    begin
+      redis.subscribe("__keyevent@0__:expired") do |on|
+        on.subscribe do |channel, subscriptions|
+          puts "Subscribed to ##{channel} (#{subscriptions} subscriptions)"
+        end
+
+        on.message do |channel, message|
+          puts "got a message"
+          round_over
+          redis.unsubscribe if message == "exit"
+        end
+
+        on.unsubscribe do |channel, subscriptions|
+          puts "Unsubscribed from ##{channel} (#{subscriptions} subscriptions)"
+        end
+      end
+    rescue Redis::BaseConnectionError => error
+      puts "#{error}, retrying in 1s"
+      sleep 1
+      retry
+    ensure
+      #no db connection anyway
+    end
+  end
+end
+
 configure do
   # Load .env vars
   Dotenv.load
@@ -21,6 +51,7 @@ configure do
     uri = URI.parse(ENV["REDISCLOUD_URL"])
   end
   $redis = Redis.new(host: uri.host, port: uri.port, password: uri.password)
+  #start_listener
 end
 
 # Handles the POST request made by the Slack Outgoing webhook
@@ -44,7 +75,7 @@ post "/" do
       response = "Invalid token"
     elsif is_channel_blacklisted?(params[:channel_name])
       response = "Sorry, can't play in this channel."
-    elsif params[:text].match(/^jeopardy me/i)
+    elsif params[:text].match(/^#{(ENV["START_ROUND_TRIGGER"] || "jeopardy me")}/i) || params[:text].match(/^jm/i)
       response = respond_with_question(params)
     elsif params[:text].match(/my score$/i)
       response = respond_with_user_score(params[:user_id])
@@ -54,6 +85,10 @@ post "/" do
       response = respond_with_leaderboard
     elsif params[:text].match(/^show (me\s+)?(the\s+)?loserboard$/i)
       response = respond_with_loserboard
+    elsif params[:text].match(/^insult$/i)
+      response = get_insult
+    elsif params[:text].match(/^reset$/i)
+      response = reset_score
     else
       response = process_answer(params)
     end
@@ -61,6 +96,14 @@ post "/" do
     puts "[ERROR] #{e}"
     response = ""
   end
+  status 200
+  body json_response_for_slack(response)
+end
+
+def round_over
+  channel_id = params[:channel_id]
+  mark_question_as_answered(params[:channel_id])
+  reponse = "The correct answer is `#{current_question["answer"]}`."
   status 200
   body json_response_for_slack(response)
 end
@@ -87,6 +130,7 @@ end
 # (this is so two or more users can't do `jeopardy me` within 5 seconds of each other.)
 # 
 def respond_with_question(params)
+  return get_insult if params[:user_id] == "U04C6HV49" && params["timestamp"].to_f > current_question["expiration"] 
   channel_id = params[:channel_id]
   question = ""
   unless $redis.exists("shush:question:#{channel_id}")
@@ -118,13 +162,22 @@ def get_question
   request = HTTParty.get(uri)
   puts "[LOG] #{request.body}"
   response = JSON.parse(request.body).first
-  if response["question"].nil? || response["question"].strip == ""
+  question = response["question"]
+  if question.nil? || question.strip == ""
     response = get_question
   end
   response["value"] = 200 if response["value"].nil?
   response["answer"] = Sanitize.fragment(response["answer"].gsub(/\s+(&nbsp;|&)\s+/i, " and "))
   response["expiration"] = params["timestamp"].to_f + ENV["SECONDS_TO_ANSWER"].to_f
   response
+end
+
+def get_insult
+  uri = "http://pleaseinsult.me/api"
+  request = HTTParty.get(uri)
+  response = JSON.parse(request.body).first
+  insult = response ? response[1] : 'Eat a dick'
+  insult
 end
 
 # Processes an answer submitted by a user in response to a Jeopardy round:
@@ -150,27 +203,34 @@ def process_answer(params)
     current_answer = current_question["answer"]
     user_answer = params[:text]
     answered_key = "user_answer:#{channel_id}:#{current_question["id"]}:#{user_id}"
-    if $redis.exists(answered_key)
-      reply = "You had your chance, #{get_slack_name(user_id)}. Let someone else answer."
-    elsif params["timestamp"].to_f > current_question["expiration"]
-      if is_correct_answer?(current_answer, user_answer)
-        reply = "That is correct, #{get_slack_name(user_id)}, but time's up! Remember, you have #{ENV["SECONDS_TO_ANSWER"]} seconds to answer."
-      else
-        reply = "Time's up, #{get_slack_name(user_id)}! Remember, you have #{ENV["SECONDS_TO_ANSWER"]} seconds to answer. The correct answer is `#{current_question["answer"]}`."
-      end
+    if user_answer == (ENV["ANSWER_TRIGGER"] || "answer")
+      reply = "The correct answer is `#{current_question["answer"]}`."
       mark_question_as_answered(params[:channel_id])
-    elsif is_question_format?(user_answer) && is_correct_answer?(current_answer, user_answer)
-      score = update_score(user_id, current_question["value"])
-      reply = "That is correct, #{get_slack_name(user_id)}. Your total score is #{currency_format(score)}."
-      mark_question_as_answered(params[:channel_id])
-    elsif is_correct_answer?(current_answer, user_answer)
-      score = update_score(user_id, (current_question["value"] * -1))
-      reply = "That is correct, #{get_slack_name(user_id)}, but responses have to be in the form of a question. Your total score is #{currency_format(score)}."
-      $redis.setex(answered_key, ENV["SECONDS_TO_ANSWER"], "true")
+    elsif params[:text].empty?
+      #ignore blank answer with just trigger word
     else
-      score = update_score(user_id, (current_question["value"] * -1))
-      reply = "That is incorrect, #{get_slack_name(user_id)}. Your score is now #{currency_format(score)}."
-      $redis.setex(answered_key, ENV["SECONDS_TO_ANSWER"], "true")
+      if $redis.exists(answered_key)
+        reply = get_insult
+      elsif params["timestamp"].to_f > current_question["expiration"]
+        if is_correct_answer?(current_answer, user_answer)
+          reply = "That is correct, #{get_slack_name(user_id)}, but time's up! Remember, you have #{ENV["SECONDS_TO_ANSWER"]} seconds to answer."
+        else
+          reply = "Time's up, #{get_slack_name(user_id)}! Remember, you have #{ENV["SECONDS_TO_ANSWER"]} seconds to answer. The correct answer is `#{current_question["answer"]}`."
+        end
+        mark_question_as_answered(params[:channel_id])
+      elsif is_question_format?(user_answer) && is_correct_answer?(current_answer, user_answer)
+        score = update_score(user_id, current_question["value"])
+        reply = "That is correct, #{get_slack_name(user_id)}. Your total score is #{currency_format(score)}."
+        mark_question_as_answered(params[:channel_id])
+      elsif is_correct_answer?(current_answer, user_answer)
+        score = update_score(user_id, (current_question["value"] * -1))
+        reply = "That is correct, #{get_slack_name(user_id)}, but responses have to be in the form of a question. Your total score is #{currency_format(score)}."
+        $redis.setex(answered_key, ENV["SECONDS_TO_ANSWER"], "true")
+      else
+        score = update_score(user_id, (current_question["value"] * -1))
+        reply = "That is incorrect, #{get_slack_name(user_id)}. Your score is now #{currency_format(score)}."
+        $redis.setex(answered_key, ENV["SECONDS_TO_ANSWER"], "true")
+      end
     end
   end
   reply
@@ -274,6 +334,28 @@ def update_score(user_id, score = 0)
   end
 end
 
+def reset_user_score(user_id)
+  key = "user_score:#{user_id}"
+  unless $redis.get(key).nil?
+    $redis.set(key, 0)
+  end
+end
+
+def reset_score
+  response = get_api_slack_users
+  if params[:user_id] == "U04C6GJRR"
+    if response["ok"]
+      all_slack_user_ids = response["members"].map { |u| u["id"]}
+      all_slack_user_ids.each { |user_id| reset_user_score(user_id) }
+      respond_with_leaderboard
+    else
+      "Failed"
+    end
+  else
+    "Don't be a troll"
+  end 
+end
+
 # Gets the given user's name(s) from redis.
 # If it's not in redis, makes an API request to Slack to get it,
 # and caches it in redis for a month.
@@ -304,9 +386,7 @@ end
 # make the bot reply using the user's actual name.)
 # 
 def get_slack_names_hash(user_id)
-  uri = "https://slack.com/api/users.list?token=#{ENV["API_TOKEN"]}"
-  request = HTTParty.get(uri)
-  response = JSON.parse(request.body)
+  response = get_api_slack_users
   if response["ok"]
     user = response["members"].find { |u| u["id"] == user_id }
     names = { :id => user_id, :name => user["name"]}
@@ -319,6 +399,12 @@ def get_slack_names_hash(user_id)
     names = { :id => user_id, :name => "Sean Connery" }
   end
   names
+end
+
+def get_api_slack_users
+  uri = "https://slack.com/api/users.list?token=#{ENV["API_TOKEN"]}"
+  request = HTTParty.get(uri)
+  JSON.parse(request.body)
 end
 
 # Speaks the top scores across Slack.
