@@ -130,7 +130,6 @@ end
 # (this is so two or more users can't do `jeopardy me` within 5 seconds of each other.)
 # 
 def respond_with_question(params)
-  return get_insult if params[:user_id] == "U04C6HV49" && params["timestamp"].to_f > current_question["expiration"] 
   channel_id = params[:channel_id]
   question = ""
   unless $redis.exists("shush:question:#{channel_id}")
