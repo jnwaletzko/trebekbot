@@ -343,17 +343,13 @@ end
 
 def reset_score
   response = get_api_slack_users
-  if params[:user_id] == "U04C6GJRR"
-    if response["ok"]
-      all_slack_user_ids = response["members"].map { |u| u["id"]}
-      all_slack_user_ids.each { |user_id| reset_user_score(user_id) }
-      respond_with_leaderboard
-    else
-      "Failed"
-    end
+  if response["ok"]
+    all_slack_user_ids = response["members"].map { |u| u["id"]}
+    all_slack_user_ids.each { |user_id| reset_user_score(user_id) }
+    respond_with_leaderboard
   else
-    "Don't be a troll"
-  end 
+    "Failed"
+  end
 end
 
 # Gets the given user's name(s) from redis.
